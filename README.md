@@ -14,10 +14,13 @@ conda deactivate
 conda create -n manibox python=3.9
 conda activate manibox
 
+pip install "setuptools<60" numpy==1.22.4
 pip install -e .
 
 # for student inference code, you should install these in `isaac lab conda env`:
 pip install einops
+
+pip install torch==2.1.1 torchvision==0.16.1 torchaudio==2.1.1
 ```
 
 ## Dataset

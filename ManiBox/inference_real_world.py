@@ -1,63 +1,139 @@
 #!/home/lin/software/miniconda3/envs/aloha/bin/python
 # -- coding: UTF-8
-"""
-#!/usr/bin/python3
+"""实时机器人推理模块 - Real-time Robot Inference Module
+
+本模块实现了ManiBox框架的实时机器人控制推理系统。
+通过ROS（Robot Operating System）与真实机器人硬件通信，
+使用训练好的策略模型进行实时动作预测和执行。
+
+This module implements the real-time robot control inference system for ManiBox framework.
+Communicates with real robot hardware through ROS (Robot Operating System),
+using trained policy models for real-time action prediction and execution.
+
+核心功能 / Core Functions:
+- 多策略支持：ACT、RNN、CNN-RNN等 / Multi-policy support: ACT, RNN, CNN-RNN, etc.
+- 实时视觉处理：支持RGB+深度图像 / Real-time vision processing: supports RGB + depth images
+- 多线程推理：异步推理提高响应速度 / Multi-threaded inference: asynchronous inference for better response
+- ROS通信：与机器人硬件实时数据交换 / ROS communication: real-time data exchange with robot hardware
+- 动作插值：平滑的动作执行轨迹 / Action interpolation: smooth action execution trajectories
+- YOLO物体检测：基于物体检测的视觉预处理 / YOLO object detection: vision preprocessing based on object detection
+
+支持的机器人配置 / Supported Robot Configurations:
+- 双臂操作：左臂+右臂协同控制 / Dual-arm manipulation: left + right arm coordination  
+- 移动底座：可选的移动机器人支持 / Mobile base: optional mobile robot support
+- 多相机视觉：cam_high、cam_left_wrist、cam_right_wrist / Multi-camera vision: cam_high, cam_left_wrist, cam_right_wrist
+
+架构特点 / Architecture Features:
+- 模块化设计：策略、视觉、控制分离 / Modular design: policy, vision, control separation
+- 容错机制：网络延迟和数据丢失处理 / Fault tolerance: network delay and data loss handling
+- 可配置参数：通过命令行灵活配置 / Configurable parameters: flexible configuration via command line
 """
 
-import torch
-import numpy as np
-import os
-import pickle
-import json
-import argparse
-from einops import rearrange
+# 深度学习和数值计算库 / Deep learning and numerical computation libraries
+import torch               # PyTorch深度学习框架 / PyTorch deep learning framework
+import numpy as np         # 数值计算库 / Numerical computation library
+import os                  # 操作系统接口 / Operating system interface
+import pickle              # Python对象序列化 / Python object serialization
+import json                # JSON数据处理 / JSON data processing
+import argparse            # 命令行参数解析 / Command line argument parsing
+from einops import rearrange  # 张量维度重排 / Tensor dimension rearrangement
 
+# 注释掉的工具函数导入 / Commented utility function imports
 # from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 # from policy import ACTPolicy, CNNMLPPolicy, DiffusionPolicy
-import collections
-from collections import deque
 
-import rospy
-from std_msgs.msg import Header
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import JointState
-from sensor_msgs.msg import Image as Image_msg
-from nav_msgs.msg import Odometry
-from cv_bridge import CvBridge
-import time
-import threading
-import math
-import threading
+# Python标准库 / Python standard library
+import collections        # 集合数据类型 / Collection data types
+from collections import deque  # 双端队列 / Double-ended queue
 
-from PIL import Image, ImageDraw, ImageFont
-# from 
+# ROS（机器人操作系统）相关导入 / ROS (Robot Operating System) related imports
+import rospy              # ROS Python客户端库 / ROS Python client library
+from std_msgs.msg import Header       # ROS标准消息头 / ROS standard message header
+from geometry_msgs.msg import Twist   # ROS几何消息-速度 / ROS geometry message - twist
+from sensor_msgs.msg import JointState  # ROS传感器消息-关节状态 / ROS sensor message - joint state
+from sensor_msgs.msg import Image as Image_msg  # ROS传感器消息-图像 / ROS sensor message - image
+from nav_msgs.msg import Odometry     # ROS导航消息-里程计 / ROS navigation message - odometry
+from cv_bridge import CvBridge        # ROS-OpenCV图像桥接 / ROS-OpenCV image bridge
 
-from ManiBox.yolo_process_data import YoloProcessDataByTimeStep, plot_xyxyn_boxes_to_image
-from ManiBox.train import make_policy  # , set_model_config
+# 系统和并发库 / System and concurrency libraries
+import time               # 时间处理 / Time handling
+import threading          # 多线程支持 / Multi-threading support
+import math               # 数学函数库 / Mathematical functions library
 
+# 图像处理库 / Image processing libraries
+from PIL import Image, ImageDraw, ImageFont  # Python图像库 / Python Image Library
 
+# ManiBox项目内部模块 / ManiBox internal modules
+from ManiBox.yolo_process_data import YoloProcessDataByTimeStep, plot_xyxyn_boxes_to_image  # YOLO数据处理 / YOLO data processing
+from ManiBox.train import make_policy  # 策略模型工厂函数 / Policy model factory function
+
+# 系统路径配置 / System path configuration
 import sys
-sys.path.append("./")
+sys.path.append("./")  # 添加当前目录到Python路径 / Add current directory to Python path
 
-task_config = {'camera_names': ['cam_high', 'cam_left_wrist', 'cam_right_wrist']}
+# 任务配置字典 / Task configuration dictionary
+task_config = {'camera_names': ['cam_high', 'cam_left_wrist', 'cam_right_wrist']}  # 相机名称列表 / Camera name list
 
-inference_thread = None
-inference_lock = threading.Lock()
-inference_actions = None
-inference_timestep = None
+# 全局推理线程管理变量 / Global inference thread management variables
+inference_thread = None              # 推理线程对象 / Inference thread object
+inference_lock = threading.Lock()    # 线程锁，保护共享数据 / Thread lock to protect shared data
+inference_actions = None             # 推理结果动作 / Inference result actions
+inference_timestep = None            # 推理时间步 / Inference timestep
 
 def set_seed(seed):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    """设置随机种子 / Set random seed
+    
+    为PyTorch和NumPy设置随机种子，确保推理过程的可重现性。
+    在实时推理中，固定种子有助于调试和结果对比。
+    
+    Set random seed for PyTorch and NumPy to ensure reproducibility of inference process.
+    In real-time inference, fixed seed helps with debugging and result comparison.
+    
+    Args:
+        seed (int): 随机种子值 / Random seed value
+    """
+    torch.manual_seed(seed)      # 设置PyTorch随机种子 / Set PyTorch random seed
+    np.random.seed(seed)         # 设置NumPy随机种子 / Set NumPy random seed
 
 def interpolate_action(args, prev_action, cur_action):
+    """动作插值函数 / Action interpolation function
+    
+    对连续的机器人动作进行线性插值，确保动作执行的平滑性。
+    通过计算每个关节的最大变化量，生成平滑的中间动作序列，
+    避免机器人动作突变造成的震动和不稳定。
+    
+    Perform linear interpolation between consecutive robot actions to ensure smooth execution.
+    By calculating maximum change for each joint, generate smooth intermediate action sequences,
+    avoiding vibration and instability caused by sudden action changes.
+    
+    Args:
+        args: 包含arm_steps_length的配置参数 / Configuration parameters containing arm_steps_length
+        prev_action (np.array): 前一个动作 / Previous action
+        cur_action (np.array): 当前动作 / Current action
+        
+    Returns:
+        np.array: 插值后的动作序列 / Interpolated action sequence
+    """
+    # 为左臂和右臂创建步长数组（双臂系统）/ Create step arrays for left and right arms (dual-arm system)
     steps = np.concatenate((np.array(args.arm_steps_length), np.array(args.arm_steps_length)), axis=0)
+    
+    # 计算动作变化的绝对值 / Calculate absolute difference of action changes
     diff = np.abs(cur_action - prev_action)
+    
+    # 计算每个维度需要的插值步数 / Calculate interpolation steps needed for each dimension
     step = np.ceil(diff / steps).astype(int)
+    
+    # 使用最大步数确保所有关节同步运动 / Use maximum steps to ensure synchronized motion of all joints
     step = np.max(step)
+    
+    # 如果变化很小，直接返回目标动作 / If change is small, return target action directly
     if step <= 1:
-        return cur_action[np.newaxis, :]
+        return cur_action[np.newaxis, :]  # 添加批次维度 / Add batch dimension
+    
+    # 生成线性插值序列 / Generate linear interpolation sequence
     new_actions = np.linspace(prev_action, cur_action, step + 1)
+    
+    # 返回插值序列（排除起始点）/ Return interpolation sequence (excluding starting point)
     return new_actions[1:]
 
 
@@ -103,60 +179,122 @@ def interpolate_action(args, prev_action, cur_action):
 
 
 def get_model_config(args):
-    # 设置随机种子，你可以确保在相同的初始条件下，每次运行代码时生成的随机数序列是相同的。
+    """获取模型配置 / Get model configuration
+    
+    根据命令行参数构建模型推理所需的配置字典。
+    加载训练时保存的配置文件，确保推理时使用与训练时完全相同的模型参数。
+    这是保证模型正确加载和推理的关键步骤。
+    
+    Build model configuration dictionary required for inference based on command line arguments.
+    Load configuration file saved during training to ensure identical model parameters are used
+    for inference as during training. This is critical for proper model loading and inference.
+    
+    Args:
+        args: 命令行参数对象 / Command line arguments object
+        
+    Returns:
+        dict: 模型配置字典 / Model configuration dictionary
+    """
+    # 设置随机种子，确保在相同初始条件下每次运行的随机数序列相同 / Set random seed to ensure identical random sequences under same initial conditions
     set_seed(args.seed)
 
-    # 如果是ACT策略
-    # fixed parameters
-    
+    # 配置加载逻辑 / Configuration loading logic
     if args.load_config:
-        # load the policy config from the old model as well
-        config_file = os.path.join(args.ckpt_dir, 'config.json') # 'logs/rsl_rl/2024-06-07_22-16-34CNNRNN/config.json'
+        # 从训练保存的模型中加载策略配置 / Load policy config from trained model
+        config_file = os.path.join(args.ckpt_dir, 'config.json')  # 配置文件路径 / Config file path
         with open(config_file, 'r') as f:
-            config_json = f.read()
-        policy_config = json.loads(config_json)['policy_config']
-        print(f"The training config {args.ckpt_dir} has been synced for inference!")
+            config_json = f.read()  # 读取JSON配置 / Read JSON config
+        policy_config = json.loads(config_json)['policy_config']  # 解析策略配置 / Parse policy config
+        print(f"The training config {args.ckpt_dir} has been synced for inference!")  # 配置同步提示 / Config sync notification
     else:
-        raise NotImplementedError
+        raise NotImplementedError  # 暂不支持其他配置加载方式 / Other config loading methods not implemented
     
+    # 构建完整的推理配置字典 / Build complete inference configuration dictionary
     config = {
-        'ckpt_dir': args.ckpt_dir,
-        'ckpt_name': args.ckpt_name,
-        'ckpt_stats_name': args.ckpt_stats_name,
-        'episode_len': args.max_publish_step,
-        'state_dim': args.state_dim,
-        'policy_class': args.policy_class,
-        'policy_config': policy_config,
-        'temporal_agg': args.temporal_agg,
-        'camera_names': task_config['camera_names'],
+        'ckpt_dir': args.ckpt_dir,                    # 检查点目录 / Checkpoint directory
+        'ckpt_name': args.ckpt_name,                  # 检查点文件名 / Checkpoint filename
+        'ckpt_stats_name': args.ckpt_stats_name,      # 统计数据文件名 / Statistics filename
+        'episode_len': args.max_publish_step,         # 推理步数限制 / Inference step limit
+        'state_dim': args.state_dim,                  # 状态维度 / State dimension
+        'policy_class': args.policy_class,            # 策略类名 / Policy class name
+        'policy_config': policy_config,               # 策略详细配置 / Detailed policy config
+        'temporal_agg': args.temporal_agg,            # 时序聚合配置 / Temporal aggregation config
+        'camera_names': task_config['camera_names'],  # 相机名称列表 / Camera names list
     }
-    return config
+    return config  # 返回配置字典 / Return configuration dictionary
 
-last_right_image = None
+last_right_image = None  # 全局变量：保存上一帧右手相机图像 / Global variable: store last right camera image
+
 def get_image(observation, camera_names):
-    global last_right_image
-    curr_images = []
+    """获取和预处理相机图像 / Get and preprocess camera images
+    
+    从观测数据中提取多相机图像，进行格式转换和归一化处理。
+    将图像从HWC格式转换为CHW格式，并转换为PyTorch张量送入GPU。
+    
+    Extract multi-camera images from observation data, perform format conversion and normalization.
+    Convert images from HWC format to CHW format, and convert to PyTorch tensor on GPU.
+    
+    Args:
+        observation (dict): 包含图像数据的观测字典 / Observation dictionary containing image data
+        camera_names (list): 相机名称列表 / List of camera names
+        
+    Returns:
+        torch.Tensor: 预处理后的图像张量，形状[1, num_cams, 3, H, W] / Preprocessed image tensor with shape [1, num_cams, 3, H, W]
+    """
+    global last_right_image  # 声明全局变量 / Declare global variable
+    
+    curr_images = []  # 当前帧图像列表 / Current frame image list
+    
+    # 遍历所有相机，提取图像数据 / Iterate through all cameras to extract image data
     for cam_name in camera_names:
+        # 将图像从HWC格式重排为CHW格式 / Rearrange image from HWC to CHW format
         curr_image = rearrange(observation['images'][cam_name], 'h w c -> c h w')
+        
+        # 特殊处理右手相机图像（用于调试）/ Special handling for right wrist camera (for debugging)
         if cam_name == 'cam_right_wrist':
-            # print(f"Image of Right is {curr_image}")
-            # if last_right_image is not None:
-            #     print(f"right image distance {np.linalg.norm(curr_image - last_right_image)}")
+            # 保存当前右手相机图像用于调试 / Save current right camera image for debugging
             last_right_image = curr_image
             
-        curr_images.append(curr_image)
-    curr_image = np.stack(curr_images, axis=0)
-    curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)  # 
-    return curr_image
+        curr_images.append(curr_image)  # 添加到图像列表 / Add to image list
+    
+    # 将多个相机图像堆叠为四维数组 / Stack multiple camera images into 4D array
+    curr_image = np.stack(curr_images, axis=0)  # 形状: [num_cams, 3, H, W] / Shape: [num_cams, 3, H, W]
+    
+    # 转换为PyTorch张量，归一化到[0,1]范围，移至GPU并添加批次维度 / Convert to PyTorch tensor, normalize to [0,1], move to GPU and add batch dimension
+    curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)  # 形状: [1, num_cams, 3, H, W] / Shape: [1, num_cams, 3, H, W]
+    
+    return curr_image  # 返回预处理后的图像张量 / Return preprocessed image tensor
 
 
 def get_depth_image(observation, camera_names):
-    curr_images = []
+    """获取和预处理深度图像 / Get and preprocess depth images
+    
+    从观测数据中提取多相机深度图像，进行归一化处理。
+    深度图像通常用于提供3D空间信息，增强机器人的空间感知能力。
+    
+    Extract multi-camera depth images from observation data and perform normalization.
+    Depth images are typically used to provide 3D spatial information, enhancing robot spatial perception.
+    
+    Args:
+        observation (dict): 包含深度图像数据的观测字典 / Observation dictionary containing depth image data
+        camera_names (list): 相机名称列表 / List of camera names
+        
+    Returns:
+        torch.Tensor: 预处理后的深度图像张量 / Preprocessed depth image tensor
+    """
+    curr_images = []  # 当前帧深度图像列表 / Current frame depth image list
+    
+    # 遍历所有相机，提取深度图像数据 / Iterate through all cameras to extract depth image data
     for cam_name in camera_names:
-        curr_images.append(observation['images_depth'][cam_name])
+        curr_images.append(observation['images_depth'][cam_name])  # 添加深度图像 / Add depth image
+    
+    # 堆叠多相机深度图像 / Stack multi-camera depth images
     curr_image = np.stack(curr_images, axis=0)
+    
+    # 转换为PyTorch张量，归一化并移至GPU / Convert to PyTorch tensor, normalize and move to GPU
     curr_image = torch.from_numpy(curr_image / 255.0).float().cuda().unsqueeze(0)
-    return curr_image
+    
+    return curr_image  # 返回预处理后的深度图像张量 / Return preprocessed depth image tensor
 
 
 def inference_thread_fn(args, config, ros_operator, policy, next_actions, stats, t, pre_action, yolo_process_data=None):
@@ -359,287 +497,353 @@ def model_inference(args, config, ros_operator, save_episode=True):
     # 2 加载模型权重 (in make_policy)
     # ckpt_path = os.path.join(config['ckpt_dir'], config['ckpt_name'])
     # state_dict = torch.load(ckpt_path)
+    # 状态字典过滤（已注释）/ State dict filtering (commented)
     # new_state_dict = {}
     # for key, value in state_dict.items():
     #     if key in ["model.is_pad_head.weight", "model.is_pad_head.bias"]:
-    #         continue
+    #         continue  # 跳过填充头权重 / Skip padding head weights
     #     if args.max_pos_lookahead == 0 and key in ["model.input_proj_next_action.weight", "model.input_proj_next_action.bias"]:
-    #         continue
+    #         continue  # 跳过下一动作投影权重 / Skip next action projection weights
     #     new_state_dict[key] = value
-    # loading_status = policy.deserialize(new_state_dict)
+    # loading_status = policy.deserialize(new_state_dict)  # 反序列化模型状态 / Deserialize model state
     # if not loading_status:
-    #     print("ckpt path not exist")
+    #     print("ckpt path not exist")  # 检查点路径不存在 / Checkpoint path does not exist
     #     return False
 
-    # 3 模型设置为cuda模式和验证模式
-    policy = policy.cuda()
-    policy.eval()  # or policy.model.eval()
+    # 3. 模型设备和模式设置 / Model device and mode setup
+    policy = policy.cuda()  # 将模型移至GPU / Move model to GPU
+    policy.eval()  # 设置模型为评估模式，禁用dropout和batch normalization训练行为 / Set model to evaluation mode, disable dropout and batch normalization training behavior
 
-    # 4 加载统计值
+    # 4. 加载数据统计信息 / Load data statistics
     stats_path = os.path.join(config['ckpt_dir'], config['ckpt_stats_name'])
-    # 统计的数据  # 加载action_mean, action_std, qpos_mean, qpos_std 14维
+    # 加载统计数据：action_mean, action_std, qpos_mean, qpos_std（14维）/ Load statistics: action_mean, action_std, qpos_mean, qpos_std (14-dim)
     with open(stats_path, 'rb') as f:
-        stats = pickle.load(f)
+        stats = pickle.load(f)  # 反序列化统计数据 / Deserialize statistics data
 
-    # 数据预处理和后处理函数定义
-    pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
+    # 数据预处理和后处理函数定义 / Data preprocessing and postprocessing function definition
+    pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']  # 关节位置标准化 / Joint position normalization
     if args.use_dataset_action:
-        post_process = lambda a: a * stats['action_std'] + stats['action_mean']
+        post_process = lambda a: a * stats['action_std'] + stats['action_mean']  # 动作反标准化 / Action denormalization
     else:
-        post_process = lambda a: a * stats['qpos_std'] + stats['qpos_mean']
+        post_process = lambda a: a * stats['qpos_std'] + stats['qpos_mean']  # 关节位置反标准化 / Joint position denormalization
 
-    max_publish_step = config['episode_len']
-    chunk_size = config['policy_config']['chunk_size']
+    # 推理参数设置 / Inference parameter setup
+    max_publish_step = config['episode_len']         # 最大发布步数 / Maximum publish steps
+    chunk_size = config['policy_config']['chunk_size']  # 动作块大小 / Action chunk size
 
-    # Initialize position of the puppet arm
+    # 机械臂初始位置设定 / Robot arm initial position setup
+    # 原始测试位置（已注释）/ Original test positions (commented)
     # left0 = [-0.00133514404296875, 0.00209808349609375, 0.01583099365234375, -0.032616615295410156, -0.00286102294921875, 0.00095367431640625, 3.557830810546875]
     # right0 = [-0.00133514404296875, 0.00438690185546875, 0.034523963928222656, -0.053597450256347656, -0.00476837158203125, -0.00209808349609375, 3.557830810546875]
     # left1 = [-0.00133514404296875, 0.00209808349609375, 0.01583099365234375, -0.032616615295410156, -0.00286102294921875, 0.00095367431640625, -0.3393220901489258]
     # right1 = [-0.00133514404296875, 0.00247955322265625, 0.01583099365234375, -0.032616615295410156, -0.00286102294921875, 0.00095367431640625, -0.3397035598754883]
-    left1 = [0] * 6 + [-0.1350]
-    # left1 = [-0.0050,  0.0520, -0.0080, -0.0000,  0.0000,  0.0000, -0.1350]
-    right1 = [0] * 6 + [-0.1350]
-    left0 = left1[:6] + [3.557830810546875]
-    right0 = right1[:6] + [3.557830810546875]
+    
+    # 左臂位置：6个关节角度 + 夹爪开合度 / Left arm position: 6 joint angles + gripper openness
+    left1 = [0] * 6 + [-0.1350]  # 夹爪开合状态 / Gripper open state
+    # left1 = [-0.0050,  0.0520, -0.0080, -0.0000,  0.0000,  0.0000, -0.1350]  # 备选左臂位置 / Alternative left arm position
+    right1 = [0] * 6 + [-0.1350]  # 右臂夹爪开合状态 / Right arm gripper open state
+    left0 = left1[:6] + [3.557830810546875]   # 左臂夹爪关闭状态 / Left arm gripper closed state
+    right0 = right1[:6] + [3.557830810546875]  # 右臂夹爪关闭状态 / Right arm gripper closed state
+    # 备选初始位置（已注释）/ Alternative initial positions (commented)
     # left0 = [0] * 6 + [3.557830810546875]
     # left1 = [0] * 6 + [-0.3393220901489258]
     # right0 = [0] * 6 + [3.557830810546875]
     # right1 = [0] * 6 + [-0.3397035598754883]
     
     
-    ros_operator.puppet_arm_publish_continuous(left0, right0)  # recover
+    # 发布初始恢复位置 / Publish initial recovery position
+    ros_operator.puppet_arm_publish_continuous(left0, right0)  # 恢复到初始位置 / Recover to initial position
     
+    # 策略类型判断和预处理设置 / Policy type determination and preprocessing setup
     if config['policy_class'] in ["RNN", "FCNet", "DiffusionState", "CEPPolicy"]:
-        is_qpos_normalized = False
-        yolo_preprocess = True
+        is_qpos_normalized = False  # 不需要关节位置标准化 / No joint position normalization needed
+        yolo_preprocess = True      # 需要YOLO预处理 / YOLO preprocessing required
     else:
-        is_qpos_normalized = True
-        yolo_preprocess = False
+        is_qpos_normalized = True   # 需要关节位置标准化 / Joint position normalization required
+        yolo_preprocess = False     # 不需要YOLO预处理 / No YOLO preprocessing needed
     
+    # YOLO数据处理器初始化 / YOLO data processor initialization
     if yolo_preprocess:
-        yolo_process_data = YoloProcessDataByTimeStep()
-        yolo_process_data.reset_new_episode()
-        policy.reset_recur(1, "cuda:0")
+        yolo_process_data = YoloProcessDataByTimeStep()  # 创建YOLO处理器 / Create YOLO processor
+        yolo_process_data.reset_new_episode()            # 重置新回合 / Reset new episode
+        policy.reset_recur(1, "cuda:0")                  # 重置策略递归状态 / Reset policy recurrent state
     else:
-        yolo_process_data = None
-    # input("Press any key to continue")
+        yolo_process_data = None  # 不使用YOLO处理器 / No YOLO processor
+    # input("Press any key to continue")  # 等待用户输入（已注释）/ Wait for user input (commented)
+    # 目标物体检测和用户交互 / Target object detection and user interaction
     if yolo_preprocess:
-        while True:
+        while True:  # 循环直到成功检测到目标物体 / Loop until target object is successfully detected
             try:
-                prompt = input("Please input the object you wish to grab, the default is 'apple', then press enter to continue: ")
+                prompt = input("Please input the object you wish to grab, the default is 'apple', then press enter to continue: ")  # 获取用户输入的目标物体 / Get user input for target object
             except KeyboardInterrupt:
-                print("Interrupted")
+                print("Interrupted")  # 用户中断 / User interruption
                 exit(0)
             if prompt == "":
-                prompt = "apple"
-            print("your prompt:", prompt)
-            yolo_process_data.modify_objects_names(prompt)
-            if detect_object(prompt, ros_operator, yolo_process_data):
-                break
+                prompt = "apple"  # 默认目标物体 / Default target object
+            print("your prompt:", prompt)  # 显示用户选择的目标 / Display user's target selection
+            yolo_process_data.modify_objects_names(prompt)  # 修改YOLO检测器的目标物体名称 / Modify YOLO detector's target object name
+            if detect_object(prompt, ros_operator, yolo_process_data):  # 尝试检测目标物体 / Attempt to detect target object
+                break  # 检测成功，退出循环 / Detection successful, exit loop
     else:        
-        input("Press any key to continue")
+        input("Press any key to continue")  # 等待用户输入继续 / Wait for user input to continue
         
-    ros_operator.puppet_arm_publish_continuous(left1, right1)
+    # 设置机械臂到工作位置 / Set robot arm to working position
+    ros_operator.puppet_arm_publish_continuous(left1, right1)  # 发布工作位置（夹爪开启）/ Publish working position (gripper open)
     
-    # Initialize the previous action to be the initial robot state
-    pre_action = np.zeros(config['state_dim'])
+    # 初始化前一动作为机器人初始状态 / Initialize previous action as initial robot state
+    pre_action = np.zeros(config['state_dim'])  # 创建零动作向量 / Create zero action vector
     pre_action[:14] = np.array(
-        left1 + 
-        right1
+        left1 +   # 左臂7维（6个关节+夹爪）/ Left arm 7-dim (6 joints + gripper)
+        right1    # 右臂7维（6个关节+夹爪）/ Right arm 7-dim (6 joints + gripper)
     )
-    action = None
+    action = None  # 初始化动作为空 / Initialize action as None
     
     
     
-    # Inference loop
-    with torch.inference_mode():
-        while True and not rospy.is_shutdown():
-            # The current time step
+    # 推理主循环 / Main inference loop
+    with torch.inference_mode():  # 推理模式，禁用梯度计算 / Inference mode, disable gradient computation
+        while True and not rospy.is_shutdown():  # 持续运行直到ROS关闭 / Continue running until ROS shutdown
+            # 当前时间步 / Current time step
             t = 0
-            # max_t = 0
-            rate = rospy.Rate(args.publish_rate)
-            # if config['temporal_agg']:
-            #     all_time_actions = np.zeros([max_publish_step, max_publish_step + chunk_size, config['state_dim']])
+            # max_t = 0  # 最大时间步（已注释）/ Maximum time step (commented)
+            rate = rospy.Rate(args.publish_rate)  # 设置发布频率 / Set publish rate
+            # 时序聚合动作缓冲区初始化（已注释）/ Temporal aggregation action buffer initialization (commented)
+            # if config['temporal_agg']:  
+            #     all_time_actions = np.zeros([max_publish_step, max_publish_step + chunk_size, config['state_dim']])  # 所有时间步的动作矩阵 / Action matrix for all timesteps
             
-            # Start the first thread and initialize the action buffer
-            inference_thread = threading.Thread(target=inference_thread_fn,
-                                                args=(args, config, ros_operator,
+            # 启动第一个推理线程并初始化动作缓冲区 / Start the first thread and initialize the action buffer
+            inference_thread = threading.Thread(target=inference_thread_fn,  # 创建推理线程 / Create inference thread
+                                                args=(args, config, ros_operator,  # 传递参数 / Pass arguments
                                                     policy, None, stats, t, pre_action, yolo_process_data))
-            inference_thread.start()
-            action_buffer = np.zeros([chunk_size, config['state_dim']])
+            inference_thread.start()  # 启动推理线程 / Start inference thread
+            action_buffer = np.zeros([chunk_size, config['state_dim']])  # 初始化动作缓冲区 / Initialize action buffer
             
-            while t < max_publish_step and not rospy.is_shutdown():
-                start_time = time.time()
-                # query policy
+            # 推理执行循环 / Inference execution loop
+            while t < max_publish_step and not rospy.is_shutdown():  # 在最大步数内且ROS未关闭时循环 / Loop within max steps and ROS not shutdown
+                start_time = time.time()  # 记录开始时间 / Record start time
+                # 查询策略 / Query policy
+                # ACT策略的位置前瞻处理（已注释）/ ACT policy position lookahead processing (commented)
                 # if config['policy_class'] == "ACT":
-                    # if args.max_pos_lookahead != 0:
-                    #     if t == 0:
+                    # if args.max_pos_lookahead != 0:  # 如果使用位置前瞻 / If using position lookahead
+                    #     if t == 0:  # 第一个时间步 / First timestep
                     #         pre_action = None
                     #         inference_thread = threading.Thread(target=inference_process,
                     #                                             args=(args, config, ros_operator,
                     #                                                   policy, None, stats, t, pre_action))
                     #         inference_thread.start()
-                    #     if t >= max_t:
+                    #     if t >= max_t:  # 达到最大时间步时 / When reaching max timestep
                     #         if inference_thread is not None:
-                    #             inference_thread.join()
-                    #             inference_lock.acquire()
+                    #             inference_thread.join()  # 等待推理线程完成 / Wait for inference thread completion
+                    #             inference_lock.acquire()  # 获取推理锁 / Acquire inference lock
                     #             if inference_actions is not None:
                     #                 inference_thread = None
-                    #                 all_actions = inference_actions
+                    #                 all_actions = inference_actions  # 获取推理结果 / Get inference results
                     #                 inference_actions = None
-                    #                 max_t = t + args.pos_lookahead_step
-                    #                 if config['temporal_agg']:
+                    #                 max_t = t + args.pos_lookahead_step  # 更新最大时间步 / Update max timestep
+                    #                 if config['temporal_agg']:  # 时序聚合处理 / Temporal aggregation processing
                     #                     all_time_actions[[t], t:t + chunk_size] = all_actions
-                    #             inference_lock.release()
-                    #             pre_action = post_process(all_actions[0][args.pos_lookahead_step-1])
-                    #             inference_thread = threading.Thread(target=inference_process,
+                    #             inference_lock.release()  # 释放推理锁 / Release inference lock
+                    #             pre_action = post_process(all_actions[0][args.pos_lookahead_step-1])  # 后处理前一动作 / Post-process previous action
+                    #             inference_thread = threading.Thread(target=inference_process,  # 启动新的推理线程 / Start new inference thread
                     #                                                 args=(args, config, ros_operator,
                     #                                                       policy, all_actions[0][:args.pos_lookahead_step], stats, t, pre_action))
                     #             inference_thread.start()
-                    #             print("inference:t=", t)
-                    # else:
-                        # if t >= max_t:
+                    #             print("inference:t=", t)  # 打印推理时间步 / Print inference timestep
+                    # else:  # 不使用位置前瞻 / Not using position lookahead
+                        # if t >= max_t:  # 条件判断（已注释）/ Condition check (commented)
 
-                # When coming to the middle or the end of the action chunk
+                # 当到达动作块的中间或末尾时 / When coming to the middle or the end of the action chunk
                 
+                # 单步推理策略处理 / Single-step inference policy processing
                 if config['policy_class'] in ["FCNet", "RNN", "DiffusionState", "CEPPolicy"]:
-                    inference_thread.join()
-                    action, action_t = get_inference_result(inference_thread, inference_lock, 
+                    inference_thread.join()  # 等待推理线程完成 / Wait for inference thread completion
+                    action, action_t = get_inference_result(inference_thread, inference_lock,   # 获取推理结果 / Get inference result
                                                 inference_actions, inference_timestep)
-                    # the action of model output shape: (1, 14)
-                    # action: (14)
+                    # 模型输出动作形状: (1, 14) / Model output action shape: (1, 14)
+                    # 处理后动作: (14) / Processed action: (14)
                     
-                    # print(f"inference one-step action {action}")
-                    raw_action = action
+                    # print(f"inference one-step action {action}")  # 打印单步推理动作（已注释）/ Print one-step inference action (commented)
+                    raw_action = action  # 保存原始动作 / Save raw action
                     
+                    # 后续推理线程启动（已注释）/ Subsequent inference thread start (commented)
                     # inference_thread = threading.Thread(target=inference_thread_fn,
                     #                                     args=(args, config, ros_operator,
                     #                                             policy, None, stats, t, pre_action, yolo_process_data))
                     # inference_thread.start()
                 
-                if config['policy_class'] == "ACTPolicy" and t % (chunk_size // 2) == 0:
-                    # Wait for the previous inference thread to finish
+                # ACT策略的块推理处理 / ACT policy chunk inference processing
+                if config['policy_class'] == "ACTPolicy" and t % (chunk_size // 2) == 0:  # 每半个chunk执行一次推理 / Execute inference every half chunk
+                    # 等待前一个推理线程完成 / Wait for the previous inference thread to finish
                     inference_thread.join()
-                    action_chunk, action_t = get_inference_result(inference_thread, inference_lock, 
+                    action_chunk, action_t = get_inference_result(inference_thread, inference_lock,   # 获取动作块推理结果 / Get action chunk inference result
                                                 inference_actions, inference_timestep)
-                    action_buffer = update_action_buffer(action_buffer, action_chunk, action_t)
+                    action_buffer = update_action_buffer(action_buffer, action_chunk, action_t)  # 更新动作缓冲区 / Update action buffer
 
-                    # Start a new inference thread
+                    # 启动新的推理线程 / Start a new inference thread
                     inference_thread = threading.Thread(target=inference_thread_fn,
                                                         args=(args, config, ros_operator,
                                                                 policy, None, stats, t, pre_action, yolo_process_data))
-                    inference_thread.start()
+                    inference_thread.start()  # 启动线程 / Start thread
                 
-                # inference_thread.join()
-                # inference_lock.acquire()
+                # 推理结果处理和时序聚合（已注释）/ Inference result processing and temporal aggregation (commented)
+                # inference_thread.join()  # 等待推理线程 / Wait for inference thread
+                # inference_lock.acquire()  # 获取推理锁 / Acquire inference lock
                 # if inference_actions is not None:
                 #     inference_thread = None
-                #     all_actions = inference_actions
+                #     all_actions = inference_actions  # 获取所有动作 / Get all actions
                 #     inference_actions = None
-                    # max_t = t + args.pos_lookahead_step
-                    # if config['temporal_agg']:
+                    # max_t = t + args.pos_lookahead_step  # 更新最大时间步 / Update max timestep
+                    # if config['temporal_agg']:  # 时序聚合处理 / Temporal aggregation processing
                     #     all_time_actions[[t], t:t + chunk_size] = all_actions
-                # inference_lock.release()
+                # inference_lock.release()  # 释放推理锁 / Release inference lock
 
+                    # 时序聚合权重计算（已注释）/ Temporal aggregation weight computation (commented)
                     # if config['temporal_agg']:
-                    #     actions_for_curr_step = all_time_actions[:, t]
-                    #     actions_populated = np.all(actions_for_curr_step != 0, axis=1)
-                    #     actions_for_curr_step = actions_for_curr_step[actions_populated]
-                    #     k = 0.01
-                    #     exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
-                    #     exp_weights = exp_weights / exp_weights.sum()
-                    #     exp_weights = exp_weights[:, np.newaxis]
-                    #     raw_action = (actions_for_curr_step * exp_weights).sum(axis=0, keepdims=True)
-                    # else:
-                    #     if args.pos_lookahead_step != 0:
-                    #         raw_action = all_actions[:, t % args.pos_lookahead_step]
+                    #     actions_for_curr_step = all_time_actions[:, t]  # 获取当前步的所有动作 / Get all actions for current step
+                    #     actions_populated = np.all(actions_for_curr_step != 0, axis=1)  # 检查非零动作 / Check non-zero actions
+                    #     actions_for_curr_step = actions_for_curr_step[actions_populated]  # 过滤有效动作 / Filter valid actions
+                    #     k = 0.01  # 指数衰减系数 / Exponential decay coefficient
+                    #     exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))  # 计算指数权重 / Compute exponential weights
+                    #     exp_weights = exp_weights / exp_weights.sum()  # 归一化权重 / Normalize weights
+                    #     exp_weights = exp_weights[:, np.newaxis]  # 扩展维度 / Expand dimensions
+                    #     raw_action = (actions_for_curr_step * exp_weights).sum(axis=0, keepdims=True)  # 加权求和 / Weighted sum
+                    # else:  # 不使用时序聚合 / Not using temporal aggregation
+                    #     if args.pos_lookahead_step != 0:  # 使用位置前瞻 / Using position lookahead
+                    #         raw_action = all_actions[:, t % args.pos_lookahead_step]  # 获取前瞻动作 / Get lookahead action
                     #     else:
-                    #         raw_action = all_actions[:, t % chunk_size]
-                # else:
+                    #         raw_action = all_actions[:, t % chunk_size]  # 获取当前块动作 / Get current chunk action
+                # else:  # 未实现的策略类型 / Unimplemented policy type
                 #     raise NotImplementedError
 
-                    raw_action = action_buffer[t % chunk_size]
+                # 从动作缓冲区获取当前动作 / Get current action from action buffer
+                raw_action = action_buffer[t % chunk_size]  # 使用循环索引获取动作 / Use circular index to get action
+                
+                # 动作后处理 / Action post-processing
                 if is_qpos_normalized:
-                    action = post_process(raw_action)
-                
-                # ros_operator.puppet_arm_publish_continuous(action[:7], action[7:])
-                # worse than the interpolation code below
-                
-                # Interpolate the original action sequence
-                if args.use_actions_interpolation:
-                    interp_actions = interpolate_action(args, pre_action, action)
+                    action = post_process(raw_action)  # 反标准化动作 / Denormalize action
                 else:
-                    interp_actions = action[np.newaxis, :]
-                # Execute the interpolated actions one by one
+                    action = raw_action  # 直接使用原始动作 / Use raw action directly
+                
+                # 直接发布动作（已注释），效果不如下面的插值代码 / Direct action publish (commented), worse than the interpolation code below
+                # ros_operator.puppet_arm_publish_continuous(action[:7], action[7:])
+                
+                # 对原始动作序列进行插值 / Interpolate the original action sequence
+                if args.use_actions_interpolation:
+                    interp_actions = interpolate_action(args, pre_action, action)  # 生成插值动作序列 / Generate interpolated action sequence
+                else:
+                    interp_actions = action[np.newaxis, :]  # 不进行插值，直接使用单个动作 / No interpolation, use single action directly
+                
+                # 逐一执行插值后的动作 / Execute the interpolated actions one by one
                 for act in interp_actions:
-                    left_action = act[:7]  # 取7维度  shape:(7)
-                    # left_action[0:6] = 0
-                    # if t <=4 :
-                    #     left_action[6] = 4.3
-                    # print("----------------------left_action[6]", left_action[6])
-                    # left_action[7] = 
-                    right_action = act[7:14]
+                    left_action = act[:7]   # 取左臂7维度 shape:(7) / Take left arm 7 dimensions
+                    # left_action[0:6] = 0  # 设置关节角度为0（已注释）/ Set joint angles to 0 (commented)
+                    # if t <=4 :  # 前几步的特殊处理（已注释）/ Special handling for first few steps (commented)
+                    #     left_action[6] = 4.3  # 设置夹爪位置 / Set gripper position
+                    # print("----------------------left_action[6]", left_action[6])  # 打印夹爪位置 / Print gripper position
+                    # left_action[7] =   # 第8维设置（未完成）/ 8th dimension setting (incomplete)
+                    right_action = act[7:14]  # 取右臂7维度 / Take right arm 7 dimensions
                     
-                    ros_operator.puppet_arm_publish(left_action, right_action)  # puppet_arm_publish_continuous_thread
+                    # 发布机械臂动作指令 / Publish robot arm action commands
+                    ros_operator.puppet_arm_publish(left_action, right_action)  # 发布左右臂动作 / Publish left and right arm actions
                 
+                    # 机器人底盘控制（可选）/ Robot base control (optional)
                     if args.use_robot_base:
-                        vel_action = act[14:16]
-                        ros_operator.robot_base_publish(vel_action)
-                    rate.sleep()
-                t += 1
+                        vel_action = act[14:16]  # 获取底盘速度动作 / Get base velocity action
+                        ros_operator.robot_base_publish(vel_action)  # 发布底盘速度 / Publish base velocity
+                    rate.sleep()  # 等待按照设定频率 / Wait according to set frequency
+                t += 1  # 时间步递增 / Increment time step
                 
+                # 单步策略的后续推理线程启动 / Subsequent inference thread start for single-step policies
                 if config['policy_class'] in ["FCNet", "RNN", "DiffusionState", "CEPPolicy"]:
-                    # inference_thread.join()
+                    # 备用推理线程管理（已注释）/ Alternative inference thread management (commented)
+                    # inference_thread.join()  # 等待线程完成 / Wait for thread completion
                     # action, action_t = get_inference_result(inference_thread, inference_lock, 
-                    #                             inference_actions, inference_timestep)
-                    # # the action of model output shape: (1, 14)
-                    # # action: (14)
+                    #                             inference_actions, inference_timestep)  # 获取结果 / Get results
+                    # # 模型输出动作形状: (1, 14) / Model output action shape: (1, 14)
+                    # # 处理后动作: (14) / Processed action: (14)
                     
-                    # print(f"inference one-step action {action}")
-                    # raw_action = action
+                    # print(f"inference one-step action {action}")  # 打印单步动作 / Print single-step action
+                    # raw_action = action  # 保存原始动作 / Save raw action
                     
+                    # 为下一步启动新的推理线程 / Start new inference thread for next step
                     inference_thread = threading.Thread(target=inference_thread_fn,
                                                         args=(args, config, ros_operator,
                                                                 policy, None, stats, t, pre_action, yolo_process_data))
-                    inference_thread.start()
-                end_time = time.time()
+                    inference_thread.start()  # 启动线程 / Start thread
+                end_time = time.time()  # 记录结束时间 / Record end time
                 
-                print("Published Step", t)
-                # print("time:", end_time - start_time)
-                # print("left_action:", left_action)
-                # print("right_action:", right_action)
-                # rate.sleep()
-                pre_action = action
+                # 打印执行信息和更新状态 / Print execution info and update state
+                print("Published Step", t)  # 打印已发布的步数 / Print published step number
+                # print("time:", end_time - start_time)  # 打印执行时间（已注释）/ Print execution time (commented)
+                # print("left_action:", left_action)  # 打印左臂动作（已注释）/ Print left arm action (commented)
+                # print("right_action:", right_action)  # 打印右臂动作（已注释）/ Print right arm action (commented)
+                # rate.sleep()  # 等待频率控制（已注释）/ Wait for rate control (commented)
+                pre_action = action  # 更新前一动作 / Update previous action
 
 
 class RosOperator:
+    """
+    ROS通信操作类 / ROS Communication Operator Class
+    
+    负责处理与机器人硬件的ROS通信，包括：/ Handles ROS communication with robot hardware, including:
+    - 机械臂控制 / Robot arm control
+    - 底盘移动 / Base movement  
+    - 相机数据获取 / Camera data acquisition
+    - 数据缓冲管理 / Data buffer management
+    
+    Attributes:
+        robot_base_deque: 机器人底盘数据队列 / Robot base data queue
+        puppet_arm_*_deque: 机械臂数据队列 / Robot arm data queues
+        img_*_deque: 图像数据队列 / Image data queues
+        bridge: CV桥接器 / CV bridge
+        *_publisher: ROS发布者 / ROS publishers
+    """
     def __init__(self, args):
-        self.robot_base_deque = None
-        self.puppet_arm_right_deque = None
-        self.puppet_arm_left_deque = None
-        self.img_front_deque = None
-        self.img_right_deque = None
-        self.img_left_deque = None
-        self.img_front_depth_deque = None
-        self.img_right_depth_deque = None
-        self.img_left_depth_deque = None
-        self.bridge = None
-        self.puppet_arm_left_publisher = None
-        self.puppet_arm_right_publisher = None
-        self.robot_base_publisher = None
-        self.puppet_arm_publish_thread = None
-        self.puppet_arm_publish_lock = None
-        self.args = args
-        self.init()
-        self.init_ros()
+        """
+        初始化ROS操作器 / Initialize ROS operator
+        
+        Args:
+            args: 命令行参数对象 / Command line arguments object
+        """
+        # 数据队列初始化 / Data queue initialization
+        self.robot_base_deque = None              # 机器人底盘数据队列 / Robot base data queue
+        self.puppet_arm_right_deque = None        # 右臂数据队列 / Right arm data queue
+        self.puppet_arm_left_deque = None         # 左臂数据队列 / Left arm data queue
+        self.img_front_deque = None               # 前置相机图像队列 / Front camera image queue
+        self.img_right_deque = None               # 右相机图像队列 / Right camera image queue
+        self.img_left_deque = None                # 左相机图像队列 / Left camera image queue
+        self.img_front_depth_deque = None         # 前置深度相机队列 / Front depth camera queue
+        self.img_right_depth_deque = None         # 右深度相机队列 / Right depth camera queue
+        self.img_left_depth_deque = None          # 左深度相机队列 / Left depth camera queue
+        
+        # ROS通信组件初始化 / ROS communication components initialization
+        self.bridge = None                        # CV桥接器 / CV bridge
+        self.puppet_arm_left_publisher = None     # 左臂发布者 / Left arm publisher
+        self.puppet_arm_right_publisher = None    # 右臂发布者 / Right arm publisher
+        self.robot_base_publisher = None          # 机器人底盘发布者 / Robot base publisher
+        
+        # 线程和同步控制 / Thread and synchronization control
+        self.puppet_arm_publish_thread = None     # 机械臂发布线程 / Robot arm publish thread
+        self.puppet_arm_publish_lock = None       # 机械臂发布锁 / Robot arm publish lock
+        
+        self.args = args                          # 保存参数 / Save arguments
+        self.init()                               # 基础初始化 / Basic initialization
+        self.init_ros()                           # ROS初始化 / ROS initialization
 
     def init(self):
-        self.bridge = CvBridge()
-        self.img_left_deque = deque()
-        self.img_right_deque = deque()
-        self.img_front_deque = deque()
-        self.img_left_depth_deque = deque()
-        self.img_right_depth_deque = deque()
+        """
+        基础组件初始化 / Basic components initialization
+        
+        初始化CV桥接器和各类数据队列 / Initialize CV bridge and various data queues
+        """
+        self.bridge = CvBridge()                  # 初始化OpenCV-ROS桥接器 / Initialize OpenCV-ROS bridge
+        
+        # 初始化图像数据队列 / Initialize image data queues
+        self.img_left_deque = deque()             # 左相机图像队列 / Left camera image queue
+        self.img_right_deque = deque()            # 右相机图像队列 / Right camera image queue
+        self.img_front_deque = deque()            # 前置相机图像队列 / Front camera image queue
+        self.img_left_depth_deque = deque()       # 左深度相机队列 / Left depth camera queue
+        self.img_right_depth_deque = deque()      # 右深度相机队列 / Right depth camera queue
         self.img_front_depth_deque = deque()
         self.puppet_arm_left_deque = deque()
         self.puppet_arm_right_deque = deque()
@@ -761,37 +965,77 @@ class RosOperator:
         self.puppet_arm_publish_thread.start()
 
     def get_frame(self):
+        """获取同步的多传感器帧数据 / Get synchronized multi-sensor frame data
+        
+        从各个传感器队列中提取时间同步的数据帧，确保所有传感器数据来自同一时刻。
+        这是实现多模态传感器融合的关键函数，处理传感器之间的时间对齐问题。
+        
+        Extract time-synchronized data frames from various sensor queues, ensuring all sensor
+        data comes from the same moment. This is a key function for multi-modal sensor fusion,
+        handling time alignment issues between sensors.
+        
+        Returns:
+            tuple/bool: 同步的传感器数据元组，如果无法同步则返回False / 
+                       Synchronized sensor data tuple, or False if synchronization fails
+        """
+        # 检查必需传感器队列是否有数据 / Check if required sensor queues have data
         if len(self.img_left_deque) == 0 or len(self.img_right_deque) == 0 or len(self.img_front_deque) == 0 or \
                 (self.args.use_depth_image and (len(self.img_left_depth_deque) == 0 or len(self.img_right_depth_deque) == 0 or len(self.img_front_depth_deque) == 0)):
-            return False
+            return False  # 数据不完整，无法获取帧 / Incomplete data, cannot get frame
+        # 计算帧同步时间戳：找到所有传感器最新数据的最早时间 / Calculate frame sync timestamp: find earliest time among latest data from all sensors
         if self.args.use_depth_image:
-            frame_time = min([self.img_left_deque[-1].header.stamp.to_sec(), self.img_right_deque[-1].header.stamp.to_sec(), self.img_front_deque[-1].header.stamp.to_sec(),
-                              self.img_left_depth_deque[-1].header.stamp.to_sec(), self.img_right_depth_deque[-1].header.stamp.to_sec(), self.img_front_depth_deque[-1].header.stamp.to_sec()])
+            # 包含深度图像的同步：需要同步RGB和深度传感器 / Sync with depth images: need to sync RGB and depth sensors
+            frame_time = min([
+                self.img_left_deque[-1].header.stamp.to_sec(),       # 左相机时间戳 / Left camera timestamp
+                self.img_right_deque[-1].header.stamp.to_sec(),      # 右相机时间戳 / Right camera timestamp  
+                self.img_front_deque[-1].header.stamp.to_sec(),      # 前相机时间戳 / Front camera timestamp
+                self.img_left_depth_deque[-1].header.stamp.to_sec(), # 左深度相机时间戳 / Left depth camera timestamp
+                self.img_right_depth_deque[-1].header.stamp.to_sec(),# 右深度相机时间戳 / Right depth camera timestamp
+                self.img_front_depth_deque[-1].header.stamp.to_sec() # 前深度相机时间戳 / Front depth camera timestamp
+            ])
         else:
-            frame_time = min([self.img_left_deque[-1].header.stamp.to_sec(), self.img_right_deque[-1].header.stamp.to_sec(), self.img_front_deque[-1].header.stamp.to_sec()])
+            # 仅RGB相机同步：只需同步三个RGB传感器 / RGB-only sync: only need to sync three RGB sensors
+            frame_time = min([
+                self.img_left_deque[-1].header.stamp.to_sec(),   # 左相机时间戳 / Left camera timestamp
+                self.img_right_deque[-1].header.stamp.to_sec(),  # 右相机时间戳 / Right camera timestamp
+                self.img_front_deque[-1].header.stamp.to_sec()   # 前相机时间戳 / Front camera timestamp
+            ])
 
+        # 验证所有传感器是否都有该时间戳之后的数据 / Verify all sensors have data after this timestamp
+        # 如果任何传感器缺少所需时间的数据，返回False / If any sensor lacks data for required time, return False
+        
+        # 检查RGB相机数据可用性 / Check RGB camera data availability
         if len(self.img_left_deque) == 0 or self.img_left_deque[-1].header.stamp.to_sec() < frame_time:
-            return False
+            return False  # 左相机数据不足 / Insufficient left camera data
         if len(self.img_right_deque) == 0 or self.img_right_deque[-1].header.stamp.to_sec() < frame_time:
-            return False
+            return False  # 右相机数据不足 / Insufficient right camera data
         if len(self.img_front_deque) == 0 or self.img_front_deque[-1].header.stamp.to_sec() < frame_time:
-            return False
+            return False  # 前相机数据不足 / Insufficient front camera data
+            
+        # 检查机械臂状态数据可用性 / Check robot arm state data availability
         if len(self.puppet_arm_left_deque) == 0 or self.puppet_arm_left_deque[-1].header.stamp.to_sec() < frame_time:
-            return False
+            return False  # 左臂状态数据不足 / Insufficient left arm state data
         if len(self.puppet_arm_right_deque) == 0 or self.puppet_arm_right_deque[-1].header.stamp.to_sec() < frame_time:
-            return False
+            return False  # 右臂状态数据不足 / Insufficient right arm state data
+            
+        # 检查深度相机数据可用性（如果启用）/ Check depth camera data availability (if enabled)
         if self.args.use_depth_image and (len(self.img_left_depth_deque) == 0 or self.img_left_depth_deque[-1].header.stamp.to_sec() < frame_time):
-            return False
+            return False  # 左深度相机数据不足 / Insufficient left depth camera data
         if self.args.use_depth_image and (len(self.img_right_depth_deque) == 0 or self.img_right_depth_deque[-1].header.stamp.to_sec() < frame_time):
-            return False
+            return False  # 右深度相机数据不足 / Insufficient right depth camera data
         if self.args.use_depth_image and (len(self.img_front_depth_deque) == 0 or self.img_front_depth_deque[-1].header.stamp.to_sec() < frame_time):
-            return False
+            return False  # 前深度相机数据不足 / Insufficient front depth camera data
+            
+        # 检查机器人底座数据可用性（如果启用）/ Check robot base data availability (if enabled)
         if self.args.use_robot_base and (len(self.robot_base_deque) == 0 or self.robot_base_deque[-1].header.stamp.to_sec() < frame_time):
-            return False
+            return False  # 机器人底座数据不足 / Insufficient robot base data
 
+        # === 数据提取阶段：从队列中提取同步时间的数据 / Data extraction phase: extract synchronized data from queues ===
+        
+        # 提取左相机图像 / Extract left camera image
         while self.img_left_deque[0].header.stamp.to_sec() < frame_time:
-            self.img_left_deque.popleft()
-        img_left = self.bridge.imgmsg_to_cv2(self.img_left_deque.popleft(), 'passthrough')
+            self.img_left_deque.popleft()  # 移除过时的数据帧 / Remove outdated data frames
+        img_left = self.bridge.imgmsg_to_cv2(self.img_left_deque.popleft(), 'passthrough')  # 转换ROS图像消息为OpenCV格式 / Convert ROS image message to OpenCV format
 
         while self.img_right_deque[0].header.stamp.to_sec() < frame_time:
             self.img_right_deque.popleft()

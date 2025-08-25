@@ -1,38 +1,80 @@
+"""简化RNN策略模块 - Clean RNN Policy Module
 
-import argparse
-import torch.nn as nn
-from torch.nn import functional as F
-import torchvision.transforms as transforms
-import torch
-from torch import nn
+这是RNNPolicy.py的简化版本，移除了一些不必要的复杂性和冰余代码。
+保留了RNN策略的核心功能，提供更清晰、简洁的实现。
+适用于理解RNN策略的基本架构和学习目的。
 
-import IPython
-from tqdm import tqdm
+This is a simplified version of RNNPolicy.py, removing unnecessary complexity 
+and redundant code. Retains core RNN policy functionality with cleaner, 
+more concise implementation. Suitable for understanding basic RNN policy 
+architecture and learning purposes.
 
-from ManiBox.yolo_process_data import YoloProcessDataByTimeStep
-from transformers import get_cosine_schedule_with_warmup
-e = IPython.embed
+与RNNPolicy.py的主要区别 / Main Differences from RNNPolicy.py:
+- 简化了损失函数选择，只使用L1损失 / Simplified loss function selection, only uses L1 loss
+- 移除了复杂的权重初始化 / Removed complex weight initialization
+- 简化了参数管理和计数 / Simplified parameter management and counting
+- 更清晰的代码结构 / Cleaner code structure
+"""
+
+# 标准库导入 / Standard library imports
+import argparse  # 命令行参数解析 / Command line argument parsing
+
+# PyTorch相关导入 / PyTorch related imports
+import torch.nn as nn  # 神经网络模块 / Neural network modules
+from torch.nn import functional as F  # 神经网络函数 / Neural network functions
+import torchvision.transforms as transforms  # 图像变换 / Image transformations
+import torch  # PyTorch核心库 / PyTorch core library
+from torch import nn  # 神经网络模块（重复导入）/ Neural network modules (duplicate import)
+
+# 调试和进度条工具 / Debugging and progress bar tools
+import IPython  # 交互式Python / Interactive Python
+from tqdm import tqdm  # 进度条显示 / Progress bar display
+
+# 项目内部模块导入 / Internal module imports
+from ManiBox.yolo_process_data import YoloProcessDataByTimeStep  # YOLO数据处理器 / YOLO data processor
+from transformers import get_cosine_schedule_with_warmup  # 余弦学习率调度器 / Cosine learning rate scheduler
+e = IPython.embed  # IPython调试快捷方式 / IPython debugging shortcut
 
 
 class RNNPolicy(nn.Module):
-    """_summary_
-
-    Args:
-        model: ...
-        optimizer: AdamW
-        scheduler: cos
-        loss_function: ...
-        policy_config: see train.py
+    """简化RNN策略类 - Simplified RNN Policy Class
+    
+    基于LSTM的简化机器人控制策略。这是一个更清晰、易于理解的RNN策略实现。
+    去除了复杂的配置选项，保留核心的LSTM时序建模能力。
+    
+    Simplified LSTM-based robot control policy. This is a cleaner, easier-to-understand
+    RNN policy implementation. Removes complex configuration options while retaining
+    core LSTM temporal modeling capabilities.
+    
+    核心组件 / Core Components:
+        - model: 简化RNN核心模型 / Simplified RNN core model
+        - optimizer: AdamW优化器 / AdamW optimizer
+        - scheduler: 余弦学习率调度器 / Cosine learning rate scheduler
+        - loss_function: 简化的L1损失函数 / Simplified L1 loss function
+    
+    策略配置 / Policy Configuration:
+        policy_config (dict): 包含所有必要的配置参数 / Contains all necessary configuration parameters
+            - camera_names: 相机名称列表 / Camera name list
+            - lr: 主学习率 / Main learning rate
+            - lr_backbone: 主干网络学习率 / Backbone learning rate
+            - rnn_layers/rnn_hidden_dim: LSTM架构参数 / LSTM architecture parameters
     """
     def __init__(self, policy_config):
-        super().__init__()
-        print("You are using RNNPolicy.")
+        """初始化简化RNN策略 / Initialize simplified RNN policy
         
-        print("policy_config", policy_config)
-        args = argparse.Namespace(**policy_config)
+        Args:
+            policy_config (dict): 策略配置字典 / Policy configuration dictionary
+        """
+        super().__init__()  # 调用父类构造函数 / Call parent class constructor
+        print("You are using RNNPolicy.")  # 打印策略类型提示 / Print policy type notification
+        
+        print("policy_config", policy_config)  # 打印配置信息 / Print configuration info
+        args = argparse.Namespace(**policy_config)  # 转换为命名空间对象 / Convert to namespace object
+        
+        # 计算相机数量 / Calculate number of cameras
         camera_num = 0
-        for _ in policy_config['camera_names']:
-            camera_num += 1
+        for _ in policy_config['camera_names']:  # 遍历相机名称列表 / Iterate through camera names
+            camera_num += 1  # 递增计数 / Increment count
         
         self.model = RNN(
             camera_num,

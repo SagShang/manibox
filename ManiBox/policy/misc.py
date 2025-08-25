@@ -1,89 +1,148 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-"""
+"""杂项功能模块 - Miscellaneous Functions Module
+
+本模块包含了各种工具函数和辅助类，主要用于分布式训练、指标记录和数据处理。
+大部分代码从 TorchVision 参考实现中复制而来，经过适配和优化。
+
 Misc functions, including distributed helpers.
+Mostly copy-paste from torchvision references, adapted and optimized.
 
-Mostly copy-paste from torchvision references.
+主要组件 / Main Components:
+- SmoothedValue: 平滑数值记录器，用于训练指标跟踪 / Smoothed value recorder for training metrics tracking
+- MetricLogger: 指标日志记录器，统一管理多个指标 / Metric logger for unified multi-metric management
+- NestedTensor: 嵌套张量类，处理不同尺寸的图像批次 / Nested tensor class for handling variable-sized image batches
+- 分布式训练工具函数 / Distributed training utility functions
+- Git版本管理工具 / Git version management tools
+
+功能特点 / Features:
+- 支持多 GPU 分布式训练 / Multi-GPU distributed training support
+- 灵活的指标统计和显示 / Flexible metric statistics and display
+- 高效的数据批处理 / Efficient data batch processing
+- ONNX 导出兼容性 / ONNX export compatibility
 """
-import os
-import subprocess
-import time
-from collections import defaultdict, deque
-import datetime
-import pickle
-from packaging import version
-from typing import Optional, List
+# 标准库导入 / Standard library imports
+import os                      # 操作系统接口 / Operating system interface
+import subprocess             # 子进程管理 / Subprocess management
+import time                   # 时间处理工具 / Time processing utilities
+import datetime               # 日期时间处理 / Date and time processing
+import pickle                 # 对象序列化 / Object serialization
+from collections import defaultdict, deque  # 默认字典和双端队列 / Default dict and double-ended queue
+from packaging import version # 版本解析工具 / Version parsing utilities
+from typing import Optional, List  # 类型提示 / Type hints
 
-import torch
-import torch.distributed as dist
-from torch import Tensor
+# PyTorch相关导入 / PyTorch related imports
+import torch                  # PyTorch核心库 / PyTorch core library
+import torch.distributed as dist  # 分布式训练 / Distributed training
+from torch import Tensor      # 张量类型 / Tensor type
 
-# needed due to empty tensor bug in pytorch and torchvision 0.5
-import torchvision
-if version.parse(torchvision.__version__) < version.parse('0.7'):
-    from torchvision.ops import _new_empty_tensor
-    from torchvision.ops.misc import _output_size
+# TorchVision导入和版本兼容性处理 / TorchVision imports and version compatibility handling
+# 由于pytorch和torchvision 0.5中的空张量bug而需要 / Needed due to empty tensor bug in pytorch and torchvision 0.5
+import torchvision            # 计算机视觉库 / Computer vision library
+if version.parse(torchvision.__version__) < version.parse('0.7'):  # 版本兼容性检查 / Version compatibility check
+    from torchvision.ops import _new_empty_tensor    # 空张量创建函数 / Empty tensor creation function
+    from torchvision.ops.misc import _output_size    # 输出尺寸计算函数 / Output size calculation function
 
 
 class SmoothedValue(object):
-    """Track a series of values and provide access to smoothed values over a
-    window or the global series average.
+    """平滑数值记录器 - Smoothed Value Recorder
+    
+    跟踪一系列数值，并提供在滑动窗口或全局序列上的平滑数值访问。
+    常用于训练过程中的损失、准确率等指标的平滑显示。
+    
+    Track a series of values and provide access to smoothed values over a
+    window or the global series average. Commonly used for smoothed display
+    of loss, accuracy and other metrics during training.
+    
+    提供的统计量 / Provided Statistics:
+    - median: 中位数 / Median value
+    - avg: 窗口平均值 / Window average
+    - global_avg: 全局平均值 / Global average  
+    - max: 最大值 / Maximum value
+    - value: 最新值 / Latest value
     """
 
     def __init__(self, window_size=20, fmt=None):
-        if fmt is None:
-            fmt = "{median:.4f} ({global_avg:.4f})"
-        self.deque = deque(maxlen=window_size)
-        self.total = 0.0
-        self.count = 0
-        self.fmt = fmt
+        """初始化平滑数值记录器 / Initialize smoothed value recorder
+        
+        Args:
+            window_size (int): 滑动窗口大小，默认20 / Sliding window size, default 20
+            fmt (str): 显示格式字符串 / Display format string
+        """
+        if fmt is None:  # 如果没有指定显示格式 / If no display format specified
+            fmt = "{median:.4f} ({global_avg:.4f})"  # 默认格式：中位数(全局平均) / Default format: median (global_avg)
+            
+        # 初始化内部数据结构 / Initialize internal data structures
+        self.deque = deque(maxlen=window_size)  # 固定大小的双端队列，用于滑动窗口 / Fixed-size deque for sliding window
+        self.total = 0.0   # 累计总和 / Cumulative total
+        self.count = 0     # 累计计数 / Cumulative count
+        self.fmt = fmt     # 显示格式 / Display format
 
     def update(self, value, n=1):
-        self.deque.append(value)
-        self.count += n
-        self.total += value * n
+        """更新数值记录 / Update value record
+        
+        Args:
+            value (float): 新数值 / New value
+            n (int): 数值数量（用于批量更新）/ Value count (for batch updates)
+        """
+        self.deque.append(value)  # 添加到滑动窗口 / Add to sliding window
+        self.count += n           # 更新总计数 / Update total count
+        self.total += value * n   # 更新加权总和 / Update weighted total sum
 
     def synchronize_between_processes(self):
+        """在多进程之间同步数值 / Synchronize values between processes
+        
+        警告：不会同步deque窗口数据！
+        Warning: does not synchronize the deque window data!
         """
-        Warning: does not synchronize the deque!
-        """
-        if not is_dist_avail_and_initialized():
-            return
+        if not is_dist_avail_and_initialized():  # 检查分布式环境 / Check distributed environment
+            return  # 非分布式环境直接返回 / Return directly in non-distributed environment
+            
+        # 创建包含计数和总和的张量 / Create tensor containing count and total
         t = torch.tensor([self.count, self.total], dtype=torch.float64, device='cuda')
-        dist.barrier()
-        dist.all_reduce(t)
-        t = t.tolist()
-        self.count = int(t[0])
-        self.total = t[1]
+        dist.barrier()      # 同步障障，等待所有进程 / Synchronization barrier, wait for all processes
+        dist.all_reduce(t)  # 所有进程的值相加 / Sum values across all processes
+        t = t.tolist()      # 转换为Python列表 / Convert to Python list
+        
+        # 更新同步后的值 / Update synchronized values
+        self.count = int(t[0])  # 更新计数 / Update count
+        self.total = t[1]       # 更新总和 / Update total
 
     @property
     def median(self):
-        d = torch.tensor(list(self.deque))
-        return d.median().item()
+        """计算窗口内数值的中位数 / Calculate median of values in window"""
+        d = torch.tensor(list(self.deque))  # 转换为张量 / Convert to tensor
+        return d.median().item()  # 返回中位数 / Return median value
 
     @property
     def avg(self):
-        d = torch.tensor(list(self.deque), dtype=torch.float32)
-        return d.mean().item()
+        """计算窗口内数值的平均值 / Calculate average of values in window"""
+        d = torch.tensor(list(self.deque), dtype=torch.float32)  # 转换为浮点张量 / Convert to float tensor
+        return d.mean().item()  # 返回平均值 / Return mean value
 
     @property
     def global_avg(self):
-        return self.total / self.count
+        """计算全局平均值 / Calculate global average value"""
+        return self.total / self.count  # 总和除以总数 / Total sum divided by total count
 
     @property
     def max(self):
-        return max(self.deque)
+        """获取窗口内最大值 / Get maximum value in window"""
+        return max(self.deque)  # 返回队列中最大值 / Return maximum value in deque
 
     @property
     def value(self):
-        return self.deque[-1]
+        """获取最新的数值 / Get latest value"""
+        return self.deque[-1]  # 返回队列最后一个元素 / Return last element in deque
 
     def __str__(self):
-        return self.fmt.format(
-            median=self.median,
-            avg=self.avg,
-            global_avg=self.global_avg,
-            max=self.max,
-            value=self.value)
+        """格式化显示所有统计信息 / Format display all statistical information"""
+        return self.fmt.format(  # 使用指定格式显示 / Display using specified format
+            median=self.median,        # 中位数 / Median
+            avg=self.avg,             # 窗口平均 / Window average
+            global_avg=self.global_avg, # 全局平均 / Global average
+            max=self.max,             # 最大值 / Maximum
+            value=self.value          # 最新值 / Latest value
+        )
 
 
 def all_gather(data):
@@ -282,26 +341,61 @@ def _max_by_axis(the_list):
 
 
 class NestedTensor(object):
+    """嵌套张量类 - Nested Tensor Class
+    
+    用于处理不同尺寸的图像批次，通过填充和掩码机制实现统一处理。
+    在Transformer模型中特别有用，可以高效处理变长序列数据。
+    
+    Used for handling image batches of different sizes through padding and masking.
+    Particularly useful in Transformer models for efficient variable-length sequence processing.
+    
+    组件 / Components:
+    - tensors: 填充后的张量数据 / Padded tensor data
+    - mask: 掩码张量，标记有效区域 / Mask tensor marking valid regions
+    """
+    
     def __init__(self, tensors, mask: Optional[Tensor]):
-        self.tensors = tensors
-        self.mask = mask
+        """初始化嵌套张量 / Initialize nested tensor
+        
+        Args:
+            tensors: 主张量数据 / Main tensor data
+            mask: 掩码张量（可选）/ Mask tensor (optional)
+        """
+        self.tensors = tensors  # 保存张量数据 / Store tensor data
+        self.mask = mask        # 保存掩码信息 / Store mask information
 
     def to(self, device):
+        """将嵌套张量移动到指定设备 / Move nested tensor to specified device
+        
+        Args:
+            device: 目标设备（CPU或GPU）/ Target device (CPU or GPU)
+            
+        Returns:
+            NestedTensor: 新的嵌套张量对象 / New nested tensor object
+        """
         # type: (Device) -> NestedTensor # noqa
-        cast_tensor = self.tensors.to(device)
-        mask = self.mask
-        if mask is not None:
-            assert mask is not None
-            cast_mask = mask.to(device)
-        else:
-            cast_mask = None
-        return NestedTensor(cast_tensor, cast_mask)
+        cast_tensor = self.tensors.to(device)  # 移动主张量到目标设备 / Move main tensor to target device
+        mask = self.mask  # 获取掩码 / Get mask
+        
+        if mask is not None:  # 如果存在掩码 / If mask exists
+            assert mask is not None  # 断言检查 / Assertion check
+            cast_mask = mask.to(device)  # 移动掩码到目标设备 / Move mask to target device
+        else:  # 无掩码情况 / No mask case
+            cast_mask = None  # 设置为None / Set to None
+            
+        return NestedTensor(cast_tensor, cast_mask)  # 返回新的嵌套张量 / Return new nested tensor
 
     def decompose(self):
-        return self.tensors, self.mask
+        """分解嵌套张量为组成部分 / Decompose nested tensor into components
+        
+        Returns:
+            tuple: (张量, 掩码) / (tensor, mask)
+        """
+        return self.tensors, self.mask  # 返回张量和掩码 / Return tensor and mask
 
     def __repr__(self):
-        return str(self.tensors)
+        """返回嵌套张量的字符串表示 / Return string representation of nested tensor"""
+        return str(self.tensors)  # 返回主张量的字符串表示 / Return string representation of main tensor
 
 
 def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):

@@ -1,42 +1,90 @@
+"""基于ResNet18的RNN策略模块 - ResNet18-based RNN Policy Module
 
-import argparse
-import torch.nn as nn
-from torch.nn import functional as F
-import torchvision.transforms as transforms
-import torch
-from torch import nn
+本模块实现了结合ResNet18视觉主干网络和LSTM时序模型的机器人控制策略。
+与简化版的RNN策略不同，该实现使用完整的CNN主干网络来处理原始图像数据。
 
-import IPython
+This module implements a robot control policy combining ResNet18 visual backbone
+with LSTM temporal modeling. Unlike the simplified RNN policy, this implementation
+uses full CNN backbone networks to process raw image data.
 
-from ManiBox.policy.backbone import DepthNet, build_backbone
-from transformers import get_cosine_schedule_with_warmup
-e = IPython.embed
+架构特点 / Architecture Features:
+- ResNet18视觉主干网络：处理原始图像 / ResNet18 visual backbone: processes raw images
+- LSTM时序模型：学习时间序列依赖 / LSTM temporal model: learns time sequence dependencies
+- 多模态输入：支持RGB+深度图像 / Multi-modal input: supports RGB + depth images
+- 可循环推理：支持实时动作预测 / Recurrent inference: supports real-time action prediction
+
+与其他策略的区别 / Differences from Other Policies:
+- 与ACTPolicy相比：使用LSTM而非Transformer / vs ACTPolicy: uses LSTM instead of Transformer
+- 与RNNPolicy相比：使用CNN主干而非YOLO预处理 / vs RNNPolicy: uses CNN backbone instead of YOLO preprocessing
+- 更适合高分辨率图像处理 / Better suited for high-resolution image processing
+"""
+
+# 标准库导入 / Standard library imports
+import argparse  # 命令行参数解析 / Command line argument parsing
+
+# PyTorch相关导入 / PyTorch related imports
+import torch.nn as nn  # 神经网络模块 / Neural network modules
+from torch.nn import functional as F  # 神经网络函数 / Neural network functions
+import torchvision.transforms as transforms  # 图像变换 / Image transformations
+import torch  # PyTorch核心库 / PyTorch core library
+from torch import nn  # 神经网络模块（重复导入）/ Neural network modules (duplicate import)
+
+# 调试工具 / Debugging tools
+import IPython  # 交互式Python / Interactive Python
+
+# 项目内部模块导入 / Internal module imports
+from ManiBox.policy.backbone import DepthNet, build_backbone  # 主干网络和深度网络 / Backbone and depth networks
+from transformers import get_cosine_schedule_with_warmup  # 余弦学习率调度器 / Cosine learning rate scheduler
+e = IPython.embed  # IPython调试快捷方式 / IPython debugging shortcut
 
 class CNNRNNPolicy(nn.Module):
-    """_summary_
-
-    Args:
-        model: CNNMLP
-        optimizer: AdamW
-        scheduler: TODO
-        loss_function: MSELoss
-        policy_config: see train.py
+    """CNN-RNN策略类 - CNN-RNN Policy Class
+    
+    结合卷积神经网络和循环神经网络的机器人控制策略。
+    CNN部分处理视觉输入，RNN部分处理时序信息，最终生成动作命令。
+    
+    Combined Convolutional Neural Network and Recurrent Neural Network for robot control.
+    CNN part processes visual inputs, RNN part handles temporal information,
+    finally generating action commands.
+    
+    架构组成 / Architecture Components:
+        - model: CNNRNN核心模型 / CNNRNN core model
+        - optimizer: AdamW优化器，支持分组学习率 / AdamW optimizer with grouped learning rates
+        - scheduler: 可选的余弦学习率调度器 / Optional cosine learning rate scheduler
+        - loss_function: 多种损失函数（L1/L2/Smooth L1）/ Multiple loss functions (L1/L2/Smooth L1)
+    
+    功能特点 / Functional Features:
+        - 支持多相机视觉输入 / Multi-camera visual input support
+        - 可选择的深度图像处理 / Optional depth image processing
+        - 循环训练和推理 / Recurrent training and inference
+        - 高分辨率图像处理能力 / High-resolution image processing capability
+    
+    配置参数 / Configuration Parameters:
+        policy_config (dict): 详细配置见train.py / Detailed configuration see train.py
     """
     def __init__(self, policy_config):
-        super().__init__()
-        print("You are using CNNRNNPolicy.")
+        """初始化CNN-RNN策略 / Initialize CNN-RNN policy
         
-        backbones = []   # list
-        depth_backbones = None
-        if policy_config['use_depth_image']:
-            depth_backbones = []
+        Args:
+            policy_config (dict): 策略配置字典 / Policy configuration dictionary
+        """
+        super().__init__()  # 调用父类构造函数 / Call parent class constructor
+        print("You are using CNNRNNPolicy.")  # 打印策略类型提示 / Print policy type notification
+        
+        # 初始化主干网络列表 / Initialize backbone network lists
+        backbones = []   # RGB图像主干网络列表 / RGB image backbone network list
+        depth_backbones = None  # 深度图像主干网络列表 / Depth image backbone network list
+        if policy_config['use_depth_image']:  # 如果使用深度图像 / If using depth images
+            depth_backbones = []  # 初始化深度主干网络列表 / Initialize depth backbone list
 
-        args = argparse.Namespace(**policy_config)
-        for _ in policy_config['camera_names']:
-            backbone = build_backbone(args)  # policy from detr need args.xxx
-            backbones.append(backbone)
-            if policy_config['use_depth_image']:
-                depth_backbones.append(DepthNet())
+        args = argparse.Namespace(**policy_config)  # 转换为命名空间对象 / Convert to namespace object
+        
+        # 为每个相机构建主干网络 / Build backbone networks for each camera
+        for _ in policy_config['camera_names']:  # 遍历相机名称列表 / Iterate through camera names
+            backbone = build_backbone(args)  # 从DETR策略中构建主干网络，需要args.xxx格式 / Build backbone from DETR policy, needs args.xxx format
+            backbones.append(backbone)  # 添加到RGB主干网络列表 / Add to RGB backbone list
+            if policy_config['use_depth_image']:  # 如果使用深度图像 / If using depth images
+                depth_backbones.append(DepthNet())  # 添加深度网络 / Add depth network
         
         self.model = CNNRNN(
             backbones,
